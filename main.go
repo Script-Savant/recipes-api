@@ -11,33 +11,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis"
 	"github.com/joho/godotenv"
+
 	"github.com/rs/xid"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
 	_ "recipes-api/docs"
+	"recipes-api/handlers"
+	"recipes-api/models"
 
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 )
 
-type Recipe struct {
-	ID           string    `json:"id" gorm:"primaryKey"`
-	Name         string    `json:"name"`
-	Tags         []string  `json:"tags" gorm:"serializer:json"`
-	Ingredients  []string  `json:"ingredients" gorm:"serializer:json"`
-	Instructions []string  `json:"instructions" gorm:"serializer:json"`
-	PublishedAt  time.Time `json:"publishedAt"`
-}
-
 var db *gorm.DB
+var redisClient *redis.Client
 
 func init() {
 	var err error
@@ -59,11 +53,19 @@ func init() {
 		log.Fatalf("Error opening database connection: %v", err)
 	}
 
-	if err := db.AutoMigrate(&Recipe{}); err != nil {
+	if err := db.AutoMigrate(&models.Recipe{}); err != nil {
 		log.Fatalf("Error migrating tables")
 	}
 
 	fmt.Println("Database connection established...")
+
+	redisClient = redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+	})
+	status := redisClient.Ping()
+	fmt.Println(status)
 
 	loadInitialData()
 }
@@ -74,7 +76,7 @@ func loadInitialData() {
 		log.Fatalf("Error reading recipes.json: %v", err)
 	}
 
-	var recipes []Recipe
+	var recipes []models.Recipe
 	if err := json.Unmarshal(file, &recipes); err != nil {
 		log.Fatalf("Error parsing recipes.json: %v", err)
 	}
@@ -102,152 +104,16 @@ func loadInitialData() {
 func main() {
 	router := gin.Default()
 
-	router.POST("/recipes", NewRecipeHandler)
-	router.GET("/recipes", ListRecipesHandler)
-	router.PUT("/recipes/:id", UpdateRecipeHandler)
-	router.DELETE("/recipes/:id", DeleteRecipeHandler)
-	router.GET("/recipes/search", SearchRecipesHandler)
+	rh := handlers.NewRecipeController(db, redisClient)
+
+	router.POST("/recipes", rh.NewRecipeHandler)
+	router.GET("/recipes", rh.ListRecipesHandler)
+	router.PUT("/recipes/:id", rh.UpdateRecipeHandler)
+	router.DELETE("/recipes/:id", rh.DeleteRecipeHandler)
+	router.GET("/recipes/search", rh.SearchRecipesHandler)
 
 	// swagger endpoint
 	router.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
 
 	router.Run(":8080")
-}
-
-// @summary Create a recipe
-// @Description Create a new recipe
-// @Tags recipes
-// @Accept json
-// @Produce json
-// @Param recipe body Recipe true "Recipe object"
-// @Success 200 {object} Recipe
-// @Router /recipes [post]
-func NewRecipeHandler(c *gin.Context) {
-	var recipe Recipe
-	if err := c.ShouldBindJSON(&recipe); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	recipe.ID = xid.New().String()
-	recipe.PublishedAt = time.Now()
-
-	if err := db.Create(&recipe).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, recipe)
-}
-
-// @Summary List Recipes
-// @Description Get all recipes
-// @Tags recipes
-// @Produce json
-// @Success 200 {array} Recipe
-// @Router /recipes [get]
-func ListRecipesHandler(c *gin.Context) {
-	var recipes []Recipe
-
-	if err := db.Find(&recipes).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch recipes"})
-		return
-	}
-
-	c.JSON(http.StatusOK, recipes)
-}
-
-// @Summary Update an existing Recipe
-// @Description Get an existing recipe and update it
-// @Tags recipes
-// @Accept json
-// @produce json
-// @Param id path string true "Recipe ID"
-// @Param recipe body Recipe true "Recipe object"
-// @Success 200 {object} Recipe
-// @Failure 400 {object} map[string]string
-// @Failure 404 {object} map[string]string
-// @Router /recipes/{id} [put]
-func UpdateRecipeHandler(c *gin.Context) {
-	id := c.Param("id")
-
-	var recipe Recipe
-	if err := c.ShouldBindJSON(&recipe); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	var existingRecipe Recipe
-	if err := db.Where("id = ?", id).First(&existingRecipe).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Recipe not found"})
-		return
-	}
-
-	recipe.ID = existingRecipe.ID
-	recipe.PublishedAt = existingRecipe.PublishedAt
-
-	if err := db.Model(&existingRecipe).Updates(&recipe).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update recipe"})
-		return
-	}
-
-	c.JSON(http.StatusOK, existingRecipe)
-}
-
-// @Summary Delete a recipe
-// @Description Delete a recipe by id
-// @Tags recipes
-// @Produce json
-// @Param id path string true "Recipe ID"
-// @Success 200 {object} map[string]string
-// @Failure 404 {object} map[string]string
-// @Router /recipes/{id} [delete]
-func DeleteRecipeHandler(c *gin.Context) {
-	id := c.Param("id")
-
-	var recipe Recipe
-	if err := db.Where("id = ?", id).First(&recipe).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Recipe not found"})
-		return
-	}
-
-	if err := db.Delete(&recipe).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete the recipe"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "Recipe has been deleted"})
-}
-
-// @Summary Search recipes
-// @Description Search recipes by tag
-// @Tags recipes
-// @Produce json
-// @Param tag query string true "Tag to search for"
-// @Success 200 {array} Recipe
-// @Router /recipes/search [get]
-func SearchRecipesHandler(c *gin.Context) {
-	tag := c.Query("tag")
-	if tag == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Tag is required"})
-	}
-
-	var recipes []Recipe
-	if err := db.Find(&recipes).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to search recipes"})
-		return
-	}
-
-	var listOfRecipes []Recipe
-	lowerTag := strings.ToLower(tag)
-
-	for _, recipe := range recipes {
-		for _, t := range recipe.Tags {
-			if strings.Contains(strings.ToLower(t), lowerTag) {
-				listOfRecipes = append(listOfRecipes, recipe)
-			}
-		}
-	}
-
-	c.JSON(http.StatusOK, listOfRecipes)
 }
