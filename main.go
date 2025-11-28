@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis"
 	"github.com/joho/godotenv"
+
 	"github.com/rs/xid"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -29,6 +31,7 @@ import (
 )
 
 var db *gorm.DB
+var redisClient *redis.Client
 
 func init() {
 	var err error
@@ -55,6 +58,14 @@ func init() {
 	}
 
 	fmt.Println("Database connection established...")
+
+	redisClient = redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+	})
+	status := redisClient.Ping()
+	fmt.Println(status)
 
 	loadInitialData()
 }
@@ -93,7 +104,7 @@ func loadInitialData() {
 func main() {
 	router := gin.Default()
 
-	rh := handlers.NewRecipeController(db)
+	rh := handlers.NewRecipeController(db, redisClient)
 
 	router.POST("/recipes", rh.NewRecipeHandler)
 	router.GET("/recipes", rh.ListRecipesHandler)

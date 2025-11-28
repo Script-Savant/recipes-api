@@ -1,22 +1,32 @@
 package handlers
 
 import (
+	"encoding/json"
 	"net/http"
 	"recipes-api/models"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis"
 	"github.com/rs/xid"
 	"gorm.io/gorm"
 )
 
 type RecipeController struct {
-	db *gorm.DB
+	db          *gorm.DB
+	redisClient *redis.Client
 }
 
-func NewRecipeController(db *gorm.DB) *RecipeController {
-	return &RecipeController{db}
+func NewRecipeController(db *gorm.DB, redisClient *redis.Client) *RecipeController {
+	return &RecipeController{db: db, redisClient: redisClient}
+}
+
+func (r *RecipeController) clearRecipeCache() {
+	keys := []string{"recipes:all"}
+	for _, k := range keys {
+		r.redisClient.Del(k)
+	}
 }
 
 // @summary Create a recipe
@@ -42,6 +52,8 @@ func (r *RecipeController) NewRecipeHandler(c *gin.Context) {
 		return
 	}
 
+	r.clearRecipeCache()
+
 	c.JSON(http.StatusOK, recipe)
 }
 
@@ -52,12 +64,26 @@ func (r *RecipeController) NewRecipeHandler(c *gin.Context) {
 // @Success 200 {array} Recipe
 // @Router /recipes [get]
 func (r *RecipeController) ListRecipesHandler(c *gin.Context) {
-	var recipes []models.Recipe
+	cacheKey := "recipes:all"
 
+	// check cache
+	cached, err := r.redisClient.Get(cacheKey).Result()
+	if err == nil {
+		var recipes []models.Recipe
+		json.Unmarshal([]byte(cached), &recipes)
+		c.JSON(http.StatusOK, recipes)
+	}
+
+	// load from DB
+	var recipes []models.Recipe
 	if err := r.db.Find(&recipes).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch recipes"})
 		return
 	}
+
+	// save to cache
+	data, _ := json.Marshal(recipes)
+	r.redisClient.Set(cacheKey, data, 5*time.Minute)
 
 	c.JSON(http.StatusOK, recipes)
 }
@@ -96,6 +122,8 @@ func (r *RecipeController) UpdateRecipeHandler(c *gin.Context) {
 		return
 	}
 
+	r.clearRecipeCache()
+
 	c.JSON(http.StatusOK, existingRecipe)
 }
 
@@ -120,6 +148,7 @@ func (r *RecipeController) DeleteRecipeHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete the recipe"})
 		return
 	}
+	r.clearRecipeCache()
 
 	c.JSON(http.StatusOK, gin.H{"message": "Recipe has been deleted"})
 }
@@ -135,6 +164,16 @@ func (r *RecipeController) SearchRecipesHandler(c *gin.Context) {
 	tag := c.Query("tag")
 	if tag == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Tag is required"})
+	}
+
+	cacheKey := "recipes:search:" + strings.ToLower(tag)
+
+	cached, err := r.redisClient.Get(cacheKey).Result()
+	if err == nil {
+		var cachedRecipes []models.Recipe
+		json.Unmarshal([]byte(cached), &cachedRecipes)
+		c.JSON(http.StatusOK, cachedRecipes)
+		return
 	}
 
 	var recipes []models.Recipe
@@ -153,6 +192,9 @@ func (r *RecipeController) SearchRecipesHandler(c *gin.Context) {
 			}
 		}
 	}
+
+	data, _ := json.Marshal(listOfRecipes)
+	r.redisClient.Set(cacheKey, data, 5*time.Minute)
 
 	c.JSON(http.StatusOK, listOfRecipes)
 }
